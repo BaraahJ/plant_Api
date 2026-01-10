@@ -5,104 +5,62 @@ import numpy as np
 import tensorflow as tf
 import io
 import os
-from typing import List
 
 app = FastAPI(title="Plant Identifier API")
+@app.get("/")
+def health_check():
+    return {"status": "ok"}
 
-# --------- إعداد الموديل ---------
-MODEL_PATH = "model/plant_model.tflite"    # استخدم الموديل الكبير غير quantized
+# --- مسارات الموديل والليبلز ---
+MODEL_PATH = "model/plant_model_quant.tflite"
 LABELS_PATH = "model/labels.txt"
+
+# --- تحميل الليبلز ---
+if not os.path.exists(LABELS_PATH):
+    raise FileNotFoundError(f"Labels file not found at {LABELS_PATH}")
+
+with open(LABELS_PATH, "r") as f:
+    class_names = [line.strip() for line in f.readlines()]
+
+# --- تحميل الموديل TFLite ---
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(f"TFLite model not found at {MODEL_PATH}")
 
 interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
 interpreter.allocate_tensors()
 
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
-INPUT_SHAPE = input_details[0]['shape'][1:3]   # [H, W]
+INPUT_SHAPE = input_details[0]['shape'][1:3]
 
-# تحميل labels
-with open(LABELS_PATH, 'r') as f:
-    class_names = [line.strip() for line in f]
-
-
-# --------- تحضير الصورة ---------
+# --- دالة تجهيز الصورة ---
 def preprocess_image(image: Image.Image):
-    image = image.convert('RGB')
-
-    # رفع الجودة → anti-aliasing
-    image = image.resize(INPUT_SHAPE, Image.Resampling.LANCZOS)
-
+    image = image.resize(INPUT_SHAPE)
     image_array = np.array(image).astype(np.float32)
-
-    # NORMALIZATION المناسب للموديلات الحديثة
-    image_array = image_array / 255.0  
-
+    if len(image_array.shape) == 2:
+        image_array = np.stack([image_array]*3, axis=-1)
     image_array = np.expand_dims(image_array, axis=0)
     return image_array
 
-
-# --------- التنبؤ ---------
+# --- دالة التنبؤ ---
 def predict_plant(image_array: np.ndarray):
     interpreter.set_tensor(input_details[0]['index'], image_array)
     interpreter.invoke()
-    logits = interpreter.get_tensor(output_details[0]['index'])[0]
+    output_data = interpreter.get_tensor(output_details[0]['index'])
+    predicted_class = np.argmax(output_data[0])
+    confidence = float(np.max(output_data[0]))
+    return predicted_class, confidence
 
-    # softmax manually
-    exp = np.exp(logits - np.max(logits))
-    probs = exp / exp.sum()
-
-    predicted_index = int(np.argmax(probs))
-    confidence = float(np.max(probs))
-
-    return predicted_index, confidence, probs
-
-
-# --------- API للصورة الواحدة ---------
+# --- API endpoint ---
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     try:
         image = Image.open(io.BytesIO(await file.read()))
-        img_array = preprocess_image(image)
-
-        idx, conf, probs = predict_plant(img_array)
+        input_data = preprocess_image(image)
+        predicted_class, confidence = predict_plant(input_data)
         return {
-            "plant_name": class_names[idx],
-            "confidence": conf,
-            "probabilities": {class_names[i]: float(p) for i, p in enumerate(probs)}
+            "plant_name": class_names[predicted_class],
+            "confidence": confidence
         }
-
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-
-# --------- API لثلاث صور مع التصويت Voting ---------
-@app.post("/predict-multi")
-async def predict_multi(files: List[UploadFile] = File(...)):
-    if len(files) != 3:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "Send exactly 3 images."}
-        )
-
-    results = []
-    votes = {}
-
-    for f in files:
-        image = Image.open(io.BytesIO(await f.read()))
-        img_array = preprocess_image(image)
-        idx, conf, _ = predict_plant(img_array)
-
-        plant = class_names[idx]
-        results.append({"plant": plant, "confidence": conf})
-
-        votes[plant] = votes.get(plant, 0) + 1
-
-    # اختيار الفئة بالأغلبية
-    final_plant = max(votes, key=votes.get)
-
-    return {
-        "images_results": results,
-        "final_prediction": final_plant,
-        "votes": votes
-    }
